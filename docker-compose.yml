@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  face:
+    container_name: face-recognition-api
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./faces:/app/faces
+    restart: unless-stopped
