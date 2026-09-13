@@ -6,6 +6,9 @@ services:
     build: .
     ports:
       - "8000:8000"
-    volumes:
-      - ./faces:/app/faces
+    environment:
+      # Обязателен: сервис отказывается стартовать без токена. Сгенерируйте
+      # случайную строку (например `openssl rand -hex 32`) и укажите тот же
+      # токен в настройках интеграции intersvyaz в Home Assistant.
+      - FACE_API_TOKEN=${FACE_API_TOKEN:?FACE_API_TOKEN must be set}
     restart: unless-stopped

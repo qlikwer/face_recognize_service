@@ -1,143 +1,132 @@
+"""Face recognition encoder API.
+
+Stateless face detector/encoder service intended to be called by the
+Home Assistant "intersvyaz" integration as a remote alternative to its local
+dlib backend (which crashes with SIGILL on CPUs without AVX support).
+
+This service intentionally does NOT own a face library (no named persons,
+no on-disk photo storage, no matching against known people). It only detects
+faces in an uploaded image and returns 128-d dlib ResNet descriptors; storing
+known faces and comparing distances/thresholds stays entirely on the caller
+side, so there is a single source of truth for who is "known".
+"""
+import io
+import logging
 import os
-import pickle
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from typing import Optional
+
 import face_recognition
-from PIL import Image
 import numpy as np
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 
-BASE_DIR = "/app"
-FACES_DIR = "/app/faces"
-ENCODINGS_FILE = "/app/faces/encodings.pkl"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("face_recognize_service")
 
-app = FastAPI(title="Face Recognition API")
+ENGINE_ID = "remote_dlib_resnet_v1"
+ENCODING_SIZE = 128
+DEFAULT_ENROLL_JITTERS = 2
+DEFAULT_RECOGNIZE_JITTERS = 1
+MAX_JITTERS = 10
 
-os.makedirs(FACES_DIR, exist_ok=True)
+API_TOKEN = os.environ.get("FACE_API_TOKEN", "").strip()
+if not API_TOKEN:
+    raise RuntimeError(
+        "FACE_API_TOKEN is not set. Refusing to start an unauthenticated "
+        "face recognition service that listens on 0.0.0.0:8000. Set the "
+        "FACE_API_TOKEN environment variable (see docker-compose.yml)."
+    )
 
-# -------------------------
-# load / save
-# -------------------------
+app = FastAPI(title="Face Recognition Encoder API", version="2.0.0")
 
-def load_encodings():
-    if os.path.exists(ENCODINGS_FILE):
-        with open(ENCODINGS_FILE, "rb") as f:
-            return pickle.load(f)
-    return {}
 
-def save_encodings(data):
-    with open(ENCODINGS_FILE, "wb") as f:
-        pickle.dump(data, f)
+def verify_token(authorization: Optional[str] = Header(None)) -> None:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization[len("Bearer "):]
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
 
-encodings_db = load_encodings()
 
-# -------------------------
-# helpers
-# -------------------------
-
-def encode_image(file) -> np.ndarray:
-    image = face_recognition.load_image_file(file)
-    enc = face_recognition.face_encodings(image)
-    if not enc:
-        raise ValueError("Face not found")
-    return enc[0]
-
-def rebuild_person(name):
-    person_dir = os.path.join(FACES_DIR, name)
-    person_encodings = []
-
-    for img in os.listdir(person_dir):
-        path = os.path.join(person_dir, img)
-        try:
-            e = encode_image(path)
-            person_encodings.append(e)
-        except:
-            continue
-
-    if not person_encodings:
-        raise ValueError("No valid faces")
-
-    encodings_db[name] = person_encodings
-    save_encodings(encodings_db)
-
-# -------------------------
-# API
-# -------------------------
-
-@app.get("/persons")
-def persons():
-    return list(encodings_db.keys())
-
-@app.post("/person")
-def add_person(name: str):
-    path = os.path.join(FACES_DIR, name)
-    if os.path.exists(path):
-        raise HTTPException(400, "Person exists")
-    os.makedirs(path)
-    encodings_db[name] = []
-    save_encodings(encodings_db)
-    return {"status": "created", "name": name}
-
-@app.post("/person/{name}/photo")
-async def add_photo(name: str, file: UploadFile = File(...)):
-    if name not in encodings_db:
-        raise HTTPException(404, "Person not found")
-
-    person_dir = os.path.join(FACES_DIR, name)
-    os.makedirs(person_dir, exist_ok=True)
-
-    img_path = os.path.join(person_dir, file.filename)
-    with open(img_path, "wb") as f:
-        f.write(await file.read())
-
+def _load_image(raw: bytes) -> np.ndarray:
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty image upload")
     try:
-        rebuild_person(name)
-    except ValueError as e:
-        os.remove(img_path)
-        raise HTTPException(400, str(e))
+        return face_recognition.load_image_file(io.BytesIO(raw))
+    except Exception as err:  # noqa: BLE001 - surfaced to the caller as 400
+        raise HTTPException(status_code=400, detail=f"Invalid image: {err}") from err
 
-    return {"status": "photo added", "name": name}
 
-@app.delete("/person/{name}")
-def delete_person(name: str):
-    if name not in encodings_db:
-        raise HTTPException(404)
+def _clamp_jitters(num_jitters: int) -> int:
+    return max(0, min(int(num_jitters), MAX_JITTERS))
 
-    import shutil
-    shutil.rmtree(os.path.join(FACES_DIR, name))
-    encodings_db.pop(name)
-    save_encodings(encodings_db)
 
-    return {"status": "deleted"}
-
-@app.post("/recognize")
-async def recognize(file: UploadFile = File(...)):
-    image = face_recognition.load_image_file(file.file)
-    
-    locations = face_recognition.face_locations(image)
-    encs = face_recognition.face_encodings(image, locations)
-
-    results = []
-
-    for idx, test_enc in enumerate(encs):
-        found = "unknown"
-
-        for name, known_encs in encodings_db.items():
-            matches = face_recognition.compare_faces(
-                known_encs,
-                test_enc,
-                tolerance=0.6
-            )
-            if True in matches:
-                found = name
-                break
-
-        results.append({
-            "id": idx,
-            "name": found
-        })
-
+@app.get("/health")
+def health(_: None = Depends(verify_token)) -> dict:
     return {
-        "count": len(results),
-        "faces": results
+        "status": "ok",
+        "engine": ENGINE_ID,
+        "encoding_size": ENCODING_SIZE,
+        "detector_model": "hog",
     }
-    
-    
+
+
+@app.post("/v1/encode/single")
+async def encode_single(
+    image: UploadFile = File(...),
+    num_jitters: int = Form(DEFAULT_ENROLL_JITTERS),
+    _: None = Depends(verify_token),
+) -> dict:
+    """Encode exactly one face, for enrolling a reference photo.
+
+    Fails with 422/no_face or 422/multiple_faces if the photo doesn't contain
+    exactly one detectable face, mirroring the local dlib worker's enrollment
+    contract in the HA integration.
+    """
+
+    raw = await image.read()
+    img = _load_image(raw)
+    locations = face_recognition.face_locations(img)
+
+    if len(locations) == 0:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "no_face", "message": "На фотографии не найдено лицо"},
+        )
+    if len(locations) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "multiple_faces",
+                "faces_detected": len(locations),
+                "message": (
+                    f"Для эталона требуется ровно одно лицо; найдено: {len(locations)}"
+                ),
+            },
+        )
+
+    encodings = face_recognition.face_encodings(
+        img, known_face_locations=locations, num_jitters=_clamp_jitters(num_jitters)
+    )
+    return {"encoding": [float(v) for v in encodings[0]], "faces_detected": 1}
+
+
+@app.post("/v1/encode/multi")
+async def encode_multi(
+    image: UploadFile = File(...),
+    num_jitters: int = Form(DEFAULT_RECOGNIZE_JITTERS),
+    _: None = Depends(verify_token),
+) -> dict:
+    """Detect and encode every face in a frame, for a recognition pass."""
+
+    raw = await image.read()
+    img = _load_image(raw)
+    locations = face_recognition.face_locations(img)
+    encodings = face_recognition.face_encodings(
+        img, known_face_locations=locations, num_jitters=_clamp_jitters(num_jitters)
+    )
+
+    faces = [
+        {"encoding": [float(v) for v in enc], "bbox": [int(c) for c in loc]}
+        for enc, loc in zip(encodings, locations)
+    ]
+    return {"faces_detected": len(faces), "faces": faces}
