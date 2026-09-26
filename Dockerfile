@@ -40,4 +40,7 @@ COPY app.py .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Keep-alive дольше, чем у клиента (общая aiohttp-сессия Home Assistant держит
+# соединение 15 с). С дефолтными 5 с uvicorn закрывал соединение, в которое
+# HA тут же слал запрос, и интеграция получала ServerDisconnectedError.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "75"]
